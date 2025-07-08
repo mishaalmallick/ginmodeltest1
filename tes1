@@ -1,0 +1,180 @@
+ATOM_TYPES = [
+    'C', 'N', 'O', 'S', 'F', 'Cl', 'Br', 'I', 'P',
+    'H', 'B', 'Si', 'Se', 'As', 'other'
+]
+ATOM_TYPES_data = {'C' :[], 'N': [], 'O': [], 'S': [], 'F': [],
+                  'Cl': [], 'Br': [], 'I': [], 'P':[], 'H': [],
+                  'B': [], 'Si': [], 'Se': [], 'As': [], 'other': []}
+
+
+Relevant_Data = {'Aromatic': [], 'In Ring': [], 'Formal Charge': [], 'sp': [], 'sp1': [], 'sp2': [], 'sp3':[],
+                 'sp3d': [], 'sp3d2': [], 'Number of Hs': [], 'Donor': [], 'Acceptor': [], 'Atomic Mass': [], 'Electronegativity': [],
+                'TPSA': [], 'LogP': [], 'Gasteiger Charge': [], 'EState Val:' []}
+
+HYBRIDIZATION_TYPES = [
+    rdchem.HybridizationType.SP, 
+    rdchem.HybridizationType.SP2, 
+    rdchem.HybridizationType.SP3,
+    rdchem.HybridizationType.SP3D,
+    rdchem.HybridizationType.SP3D2,
+]
+
+hybrid = atom.GetHybridization()
+one_hot = [int(hybrid == htype) for htype in HYBRIDIZATION_TYPES]
+
+
+ATOM_TYPES = ['C', 'N', 'O', 'S', 'F', 'Cl', 'Br', 'I', 'P', 'H', 'B', 'Si', 'Se', 'As', 'other']
+HYBRIDIZATION_TYPES = [
+    rdchem.HybridizationType.SP,
+    rdchem.HybridizationType.SP2,
+    rdchem.HybridizationType.SP3,
+    rdchem.HybridizationType.SP3D,
+    rdchem.HybridizationType.SP3D2,
+]
+
+def preprocessing_node_features(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    AllChem.ComputeGasteigerCharges(mol)
+    
+    # Get per-atom EState
+    try:
+        estates = Chem.EState.EStateIndices(mol)
+    except:
+        estates = [0.0] * mol.GetNumAtoms()
+
+    # Get per-atom TPSA and LogP/MR contributions
+    tpsa_contribs = rdMolDescriptors._CalcTPSAContribs(mol)
+    crippen_contribs = rdMolDescriptors._CalcCrippenContribs(mol)
+
+    atom_features = []
+
+    for idx, atom in enumerate(mol.GetAtoms()):
+        symbol = atom.GetSymbol()
+        symbol = symbol if symbol in ATOM_TYPES else 'other'
+
+        atom_type_feats = [int(symbol == t) for t in ATOM_TYPES]
+        hybrid = atom.GetHybridization()
+        hybrid_feats = [int(hybrid == htype) for htype in HYBRIDIZATION_TYPES]
+
+        feat = atom_type_feats + hybrid_feats + [
+            atom.GetFormalCharge(),
+            int(atom.GetIsAromatic()),
+            int(atom.IsInRing()),
+            atom.GetTotalNumHs(),
+            int(atom.GetTotalNumHs() > 0 and atom.GetAtomicNum() in [7, 8]),  # Donor (rough)
+            int(atom.GetAtomicNum() in [7, 8]),  # Acceptor (simplified)
+            atom.GetMass(),
+            Chem.GetPeriodicTable().GetElectronegativity(atom.GetAtomicNum()),
+            tpsa_contribs[idx],
+            crippen_contribs[idx][0],  # LogP
+            float(atom.GetProp('_GasteigerCharge')) if atom.HasProp('_GasteigerCharge') else 0.0,
+            estates[idx]
+        ]
+
+        atom_features.append(feat)
+
+    return atom_features
+
+
+def compute_edge_connectivity(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    edge_index = []
+
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+        edge_index.append((i, j))
+        edge_index.append((j, i))  # undirected graph
+
+    # Convert to tensor of shape [2, num_edges]
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    return edge_index
+    
+
+def compute_edge_features(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+
+    edge_index = []
+    edge_attr = []
+
+    bond_type_to_idx = {
+        Chem.rdchem.BondType.SINGLE: 0,
+        Chem.rdchem.BondType.DOUBLE: 1,
+        Chem.rdchem.BondType.TRIPLE: 2,
+        Chem.rdchem.BondType.AROMATIC: 3
+    }
+
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+
+        # One-hot bond type
+        bond_type = bond_type_to_idx.get(bond.GetBondType(), 0)
+        bond_type_onehot = [int(bond_type == k) for k in range(4)]
+
+        bond_feats = bond_type_onehot + [
+            int(bond.GetIsAromatic()),
+            int(bond.GetIsConjugated()),
+            int(bond.IsInRing())
+        ]
+
+        # Undirected: add both directions
+        edge_index.append((i, j))
+        edge_attr.append(bond_feats)
+
+        edge_index.append((j, i))
+        edge_attr.append(bond_feats)
+
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+
+    return edge_index, edge_attr
+    
+class GINModel(torch.nn.Module):
+    def __init__(self, dataset, num_layers, hidden, edge_dim=7):
+        super().__init__()
+        
+        # Initial GINE layer
+        self.initialization = GINEConv(
+            Sequential(
+                Linear(dataset.num_features, hidden),
+                ReLU(),
+                Linear(hidden, hidden),
+                ReLU(),
+                BN(hidden),
+            ),
+            edge_dim=edge_dim
+        )
+        
+        # Message passing layers
+        self.mp_layers = torch.nn.ModuleList()
+        for _ in range(num_layers - 1):
+            self.mp_layers.append(
+                GINEConv(
+                    Sequential(
+                        Linear(hidden, hidden),
+                        ReLU(),
+                        Linear(hidden, hidden),
+                        ReLU(),
+                        BN(hidden),
+                    ),
+                    edge_dim=edge_dim
+                )
+            )
+        
+        # Output layers
+        self.lin1 = Linear(hidden, hidden)
+        self.lin2 = Linear(hidden, dataset.num_classes)
+
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+
+        x = self.initialization(x, edge_index, edge_attr)
+        for conv in self.mp_layers:
+            x = conv(x, edge_index, edge_attr)
+
+        x = global_mean_pool(x, batch)
+        x = F.relu(self.lin1(x))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.lin2(x)
+        return F.log_softmax(x, dim=-1)
