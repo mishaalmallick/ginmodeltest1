@@ -130,51 +130,58 @@ def compute_edge_features(smiles):
 
     return edge_index, edge_attr
     
-class GINModel(torch.nn.Module):
-    def __init__(self, dataset, num_layers, hidden, edge_dim=7):
+class GINEModel(nn.Module):
+    def __init__(self, in_dim, hidden_dim, edge_dim, out_dim, num_layers):
         super().__init__()
-        
-        # Initial GINE layer
-        self.initialization = GINEConv(
-            Sequential(
-                Linear(dataset.num_features, hidden),
-                ReLU(),
-                Linear(hidden, hidden),
-                ReLU(),
-                BN(hidden),
-            ),
-            edge_dim=edge_dim
+        self.layers = nn.ModuleList()
+        self.layers.append(
+            GINEConv(
+                nn.Sequential(
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(hidden_dim)
+                ),
+                edge_dim=edge_dim
+            )
         )
-        
-        # Message passing layers
-        self.mp_layers = torch.nn.ModuleList()
         for _ in range(num_layers - 1):
-            self.mp_layers.append(
+            self.layers.append(
                 GINEConv(
-                    Sequential(
-                        Linear(hidden, hidden),
-                        ReLU(),
-                        Linear(hidden, hidden),
-                        ReLU(),
-                        BN(hidden),
+                    nn.Sequential(
+                        nn.Linear(hidden_dim, hidden_dim),
+                        nn.ReLU(),
+                        nn.Linear(hidden_dim, hidden_dim),
+                        nn.ReLU(),
+                        nn.BatchNorm1d(hidden_dim)
                     ),
                     edge_dim=edge_dim
                 )
             )
+
         
-        # Output layers
-        self.lin1 = Linear(hidden, hidden)
-        self.lin2 = Linear(hidden, dataset.num_classes)
+        self.jumping_pred = nn.ModuleList()
+        self.dropout = nn.Dropout(0.5)
 
-    def forward(self, data):
-        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        for i in range(num_layers + 1): 
+            dim = in_dim if i == 0 else hidden_dim
+            self.jumping_pred.append(nn.Linear(dim, out_dim))
 
-        x = self.initialization(x, edge_index, edge_attr)
-        for conv in self.mp_layers:
-            x = conv(x, edge_index, edge_attr)
+    def forward(self, x, edge_index, edge_attr, batch):
+        h = x
+        layer_outputs = [h]  
 
-        x = global_mean_pool(x, batch)
-        x = F.relu(self.lin1(x))
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.lin2(x)
-        return F.log_softmax(x, dim=-1)
+        for conv in self.layers:
+            h = conv(h, edge_index, edge_attr)
+            h = F.relu(h)
+            layer_outputs.append(h)
+
+        out = 0
+        for i, h in enumerate(layer_outputs):
+            pooled = global_mean_pool(h, batch)
+            out += self.dropout(self.jumping_pred[i](pooled))
+
+        return out
+
+    
