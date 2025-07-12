@@ -130,22 +130,52 @@ def compute_edge_features(smiles):
 
     return edge_index, edge_attr
     
+
+
+class TCNBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size=2, num_layers=2):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            dilation = 2 ** i
+            layers.append(weight_norm(nn.Conv1d(
+                input_dim, hidden_dim, kernel_size,
+                padding=(kernel_size - 1) * dilation,
+                dilation=dilation
+            )))
+            layers.append(nn.ReLU())
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):  # x: [batch, input_dim, time]
+        return self.network(x)
+
+
+
+
 class GINEModel(nn.Module):
     def __init__(self, in_dim, hidden_dim, edge_dim, out_dim, num_layers):
         super().__init__()
+        self.input_projection = (
+            nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
+        )
+
         self.layers = nn.ModuleList()
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+
         self.layers.append(
             GINEConv(
                 nn.Sequential(
-                    nn.Linear(in_dim, hidden_dim),
+                    nn.Linear(hidden_dim, hidden_dim),
                     nn.ReLU(),
                     nn.Linear(hidden_dim, hidden_dim),
                     nn.ReLU(),
                     nn.BatchNorm1d(hidden_dim)
                 ),
-                edge_dim=edge_dim
+                edge_dim = edge_dim
             )
         )
+
         for _ in range(num_layers - 1):
             self.layers.append(
                 GINEConv(
@@ -156,32 +186,32 @@ class GINEModel(nn.Module):
                         nn.ReLU(),
                         nn.BatchNorm1d(hidden_dim)
                     ),
-                    edge_dim=edge_dim
+                    edge_dim = edge_dim
                 )
             )
 
-        
-        self.jumping_pred = nn.ModuleList()
-        self.dropout = nn.Dropout(0.5)
-
-        for i in range(num_layers + 1): 
-            dim = in_dim if i == 0 else hidden_dim
-            self.jumping_pred.append(nn.Linear(dim, out_dim))
+        self.dropout = nn.Dropout(0.1)
+        self.tcn = TCNBlock(input_dim=hidden_dim, hidden_dim=hidden_dim)
+        self.final_linear = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, x, edge_index, edge_attr, batch):
-        h = x
-        layer_outputs = [h]  
+        x = self.input_projection(x)
+        layer_outputs = [global_mean_pool(x, batch)]
 
         for conv in self.layers:
-            h = conv(h, edge_index, edge_attr)
-            h = F.relu(h)
-            layer_outputs.append(h)
+            x = conv(x, edge_index, edge_attr)
+            x = F.relu(x)
+            x = self.dropout(x)
+            pooled = global_mean_pool(x, batch)
+            layer_outputs.append(pooled)
 
-        out = 0
-        for i, h in enumerate(layer_outputs):
-            pooled = global_mean_pool(h, batch)
-            out += self.dropout(self.jumping_pred[i](pooled))
+        graph_seq = torch.stack(layer_outputs, dim=1)  # [batch, num_layers+1, hidden_dim]
+        graph_seq = graph_seq.permute(0, 2, 1)         # [batch, hidden_dim, time_steps]
 
-        return out
+        tcn_out = self.tcn(graph_seq)                  # [batch, hidden_dim, time_steps]
+        final_rep = tcn_out[:, :, -1]                  # last time step
+
+        return self.final_linear(final_rep)
+
 
     
