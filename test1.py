@@ -155,7 +155,6 @@ def preprocessing(df):
 train = pd.concat([train, preprocessing(train)], axis=1)
 test = pd.concat([test, preprocessing(test)], axis=1)
 
-# Find constant columns for each target
 all_features = train.columns[7:].tolist()
 features = {}
 for target in CFG.TARGETS:
@@ -206,13 +205,13 @@ def preprocessing_node_features(smiles):
     mol = Chem.MolFromSmiles(smiles)
     AllChem.ComputeGasteigerCharges(mol)
     
-    # Get per-atom EState
+   
     try:
         estates = Chem.EState.EStateIndices(mol)
     except:
         estates = [0.0] * mol.GetNumAtoms()
 
-    # Get per-atom TPSA and LogP/MR contributions
+    
     tpsa_contribs = rdMolDescriptors._CalcTPSAContribs(mol)
     crippen_contribs = rdMolDescriptors._CalcCrippenContribs(mol)
 
@@ -256,7 +255,7 @@ def compute_edge_connectivity(smiles):
         edge_index.append((i, j))
         edge_index.append((j, i))  # undirected graph
 
-    # Convert to tensor of shape [2, num_edges]
+    #shape [2, num_edges]
     edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
     return edge_index
     
@@ -288,7 +287,7 @@ def compute_edge_features(smiles):
             int(bond.IsInRing())
         ]
 
-        # Undirected: add both directions
+        # Undirected
         edge_index.append((i, j))
         edge_attr.append(bond_feats)
 
@@ -388,7 +387,7 @@ class GINEModel(nn.Module):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
 
-        # GINE Layers
+        
         for _ in range(num_layers):
             self.layers.append(
                 GINEConv(
@@ -419,7 +418,6 @@ class GINEModel(nn.Module):
         self.final_linear = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, x, edge_index, edge_attr, batch):
-        # Project input if necessary
         x = self.input_projection(x)
 
         layer_outputs = [global_mean_pool(x, batch)]
